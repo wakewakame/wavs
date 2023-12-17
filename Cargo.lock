@@ -25,12 +25,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lazy_static"
-version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
-
-[[package]]
 name = "libc"
 version = "0.2.147"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -43,15 +37,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd8b5dd2ae5ed71462c540258bedcb51965123ad7e7ccf4b9a8cafaa4a63576d"
 
 [[package]]
-name = "rusty_v8"
-version = "0.32.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3da4a230eacc444facafaf8adec5365263ca9c18744b5ccd3aefb9dcbdebd92d"
+name = "v8"
+version = "0.80.0"
+source = "git+https://github.com/denoland/rusty_v8#fe574ecc4dc83721db442d232e0700fdd1d78dca"
 dependencies = [
  "bitflags",
  "fslock",
- "lazy_static",
- "libc",
+ "once_cell",
  "which",
 ]
 
@@ -59,7 +51,7 @@ dependencies = [
 name = "wavs"
 version = "0.1.0"
 dependencies = [
- "rusty_v8",
+ "v8",
 ]
 
 [[package]]
