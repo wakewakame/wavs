@@ -8,4 +8,6 @@ fn main() {
 			num => sum += num;
         "#,
     );
+    let mut output = vec![0f64; 2];
+    _ = (&mut *runtime).process(&vec![0f64, 1f64], &mut output);
 }
