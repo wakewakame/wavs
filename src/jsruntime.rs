@@ -3,6 +3,7 @@ use std::error;
 use std::rc::Rc;
 use std::sync::Once;
 use v8;
+use v8::inspector::*;
 
 pub trait ScriptRuntime {
     //fn init(&mut self, param: ());
@@ -48,8 +49,12 @@ impl ScriptRuntime for JsRuntime {
 
         let context = main_context.clone();
         let process_func = {
+            let mut client = InspectorClient::new();
+            let mut inspector = V8Inspector::create(&mut self.isolate, &mut client);
             let context = &*context.borrow_mut();
             let scope = &mut v8::HandleScope::with_context(&mut self.isolate, context);
+            let context = v8::Local::new(scope, context);
+            inspector.context_created(context, 1, StringView::empty(), StringView::empty());
             let code = v8::String::new(scope, code).unwrap();
             let script = v8::Script::compile(scope, code, None).unwrap();
             let process_func = script.run(scope).unwrap();
@@ -81,12 +86,15 @@ impl ScriptRuntime for JsRuntime {
             let process_func = &*process_func.borrow_mut();
             let scope = &mut v8::HandleScope::with_context(&mut self.isolate, context);
             let process_func = v8::Local::new(scope, process_func);
-            for i in 0..10 {
-                let num = v8::Integer::new(scope, i).into();
-                let this = v8::undefined(scope).into();
-                let sum = process_func.call(scope, this, &[num]).unwrap();
-                println!("{:?}", sum.int32_value(scope))
-            }
+
+            let input_array = v8::ArrayBuffer::new(scope, input.len()).into();
+            let output_array = v8::ArrayBuffer::new(scope, input.len()).into();
+
+            let this = v8::undefined(scope).into();
+            let sum = process_func
+                .call(scope, this, &[input_array, output_array])
+                .unwrap();
+            println!("{:?}", sum.int32_value(scope))
         }
 
         output
@@ -94,6 +102,46 @@ impl ScriptRuntime for JsRuntime {
             .enumerate()
             .for_each(|(i, val)| *val = input[i] * 2f64);
         Ok(())
+    }
+}
+
+struct InspectorClient(V8InspectorClientBase);
+
+impl InspectorClient {
+    fn new() -> Self {
+        Self(V8InspectorClientBase::new::<Self>())
+    }
+}
+
+impl V8InspectorClientImpl for InspectorClient {
+    fn base(&self) -> &V8InspectorClientBase {
+        &self.0
+    }
+
+    fn base_mut(&mut self) -> &mut V8InspectorClientBase {
+        &mut self.0
+    }
+
+    unsafe fn base_ptr(this: *const Self) -> *const v8::inspector::V8InspectorClientBase
+    where
+        Self: Sized,
+    {
+        // SAFETY: this pointer is valid for the whole lifetime of inspector
+        unsafe { std::ptr::addr_of!((*this).0) }
+    }
+
+    fn console_api_message(
+        &mut self,
+        _context_group_id: i32,
+        _level: i32,
+        message: &StringView,
+        _url: &StringView,
+        _line_number: u32,
+        _column_number: u32,
+        _stack_trace: &mut V8StackTrace,
+    ) {
+        // ログメッセージの出力
+        println!("{}", message);
     }
 }
 
@@ -117,5 +165,8 @@ mod tests {
         let result = runtime.process(&vec![1.0, 2.0], &mut output);
         assert!(result.is_ok());
         assert_eq!(output, vec![2.0, 4.0]);
+        let result = runtime.process(&vec![3.0, 4.0], &mut output);
+        assert!(result.is_ok());
+        assert_eq!(output, vec![6.0, 8.0]);
     }
 }
