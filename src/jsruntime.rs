@@ -22,6 +22,7 @@ pub struct JsRuntime {
 struct JsRuntimeContext {
     context: Rc<RefCell<v8::Global<v8::Context>>>,
     process_func: Rc<RefCell<v8::Global<v8::Function>>>,
+    //inspector: v8::UniqueRef<V8Inspector>,
 }
 
 impl JsRuntime {
@@ -67,6 +68,7 @@ impl ScriptRuntime for JsRuntime {
         let context = JsRuntimeContext {
             context,
             process_func,
+            //inspector,
         };
         self.isolate.set_slot(context);
 
@@ -82,25 +84,48 @@ impl ScriptRuntime for JsRuntime {
         let context = runtime_context.context.clone();
         let process_func = runtime_context.process_func.clone();
         {
+            let mut client = InspectorClient::new();
+            let mut inspector = V8Inspector::create(&mut self.isolate, &mut client);
+
             let context = &*context.borrow_mut();
             let process_func = &*process_func.borrow_mut();
             let scope = &mut v8::HandleScope::with_context(&mut self.isolate, context);
             let process_func = v8::Local::new(scope, process_func);
 
-            let input_array = v8::ArrayBuffer::new(scope, input.len()).into();
-            let output_array = v8::ArrayBuffer::new(scope, input.len()).into();
+            let context = v8::Local::new(scope, context);
+            inspector.context_created(context, 1, StringView::empty(), StringView::empty());
+
+            //let backing_store = v8::ArrayBuffer::new_backing_store(scope, input.len());
+
+            let input_array = v8::ArrayBuffer::new(scope, input.len() * 8);
+            let output_array = v8::ArrayBuffer::new(scope, output.len() * 8).into();
+
+            let input_u8 =
+                unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 8) };
+            let backing_store = input_array.get_backing_store();
+            for (i, v) in backing_store.iter().enumerate() {
+                v.set(input_u8[i]);
+            }
+
+            let input_array_t = v8::Float64Array::new(scope, input_array, 0, input.len()).unwrap();
+            let output_array_t =
+                v8::Float64Array::new(scope, output_array, 0, output.len()).unwrap();
 
             let this = v8::undefined(scope).into();
-            let sum = process_func
-                .call(scope, this, &[input_array, output_array])
+            let result = process_func
+                .call(scope, this, &[input_array_t.into(), output_array_t.into()])
                 .unwrap();
-            println!("{:?}", sum.int32_value(scope))
+            println!("{:?}", result.int32_value(scope));
+
+            let output_u8 = unsafe {
+                std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u8, output.len() * 8)
+            };
+            let backing_store = output_array.get_backing_store();
+            for (i, v) in backing_store.iter().enumerate() {
+                output_u8[i] = v.get();
+            }
         }
 
-        output
-            .iter_mut()
-            .enumerate()
-            .for_each(|(i, val)| *val = input[i] * 2f64);
         Ok(())
     }
 }
@@ -152,14 +177,16 @@ mod tests {
     #[test]
     fn compile() {
         let mut runtime: Box<dyn ScriptRuntime> = Box::new(JsRuntime::new());
-        let result = runtime.compile("num => num;");
+        let result = runtime
+            .compile("(input, output) => input.forEach((v, i) => { output[i] = v * 2.0; });");
         assert!(result.is_ok());
     }
 
     #[test]
     fn process() {
         let mut runtime: Box<dyn ScriptRuntime> = Box::new(JsRuntime::new());
-        let result = runtime.compile("num => num;");
+        let result = runtime
+            .compile("(input, output) => input.forEach((v, i) => { output[i] = v * 2.0; });");
         assert!(result.is_ok());
         let mut output = vec![0.0, 0.0];
         let result = runtime.process(&vec![1.0, 2.0], &mut output);
