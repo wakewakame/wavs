@@ -4,7 +4,6 @@ use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Once;
 use v8;
-use v8::inspector::*;
 
 pub trait ScriptRuntime {
     //fn init(&mut self, param: ());
@@ -22,10 +21,10 @@ pub struct JsRuntime {
 
 struct JsRuntimeContext {
     context: v8::Global<v8::Context>,
+    _inspector: Rc<RefCell<InspectorClient>>,
     input: v8::Global<v8::ArrayBuffer>,
     output: v8::Global<v8::ArrayBuffer>,
     process_func: v8::Global<v8::Function>,
-    //inspector: v8::UniqueRef<V8Inspector>,
 }
 
 impl JsRuntime {
@@ -49,6 +48,12 @@ impl ScriptRuntime for JsRuntime {
             v8::Global::new(handle_scope, context)
         };
 
+        let inspector = {
+            let scope = &mut v8::HandleScope::with_context(&mut self.isolate, &context);
+            let context = v8::Local::new(scope, &context);
+            InspectorClient::new(scope, context)
+        };
+
         let (input, output) = {
             let scope = &mut v8::HandleScope::with_context(&mut self.isolate, &context);
             let input = v8::ArrayBuffer::new(scope, 0);
@@ -59,11 +64,7 @@ impl ScriptRuntime for JsRuntime {
         };
 
         let process_func = {
-            let mut client = InspectorClient::new();
-            let mut inspector = V8Inspector::create(&mut self.isolate, &mut client);
             let scope = &mut v8::HandleScope::with_context(&mut self.isolate, &context);
-            let context = v8::Local::new(scope, &context);
-            inspector.context_created(context, 1, StringView::empty(), StringView::empty());
             let code = v8::String::new(scope, code).unwrap();
             let script = v8::Script::compile(scope, code, None).unwrap();
             let process_func = script.run(scope).unwrap();
@@ -74,10 +75,10 @@ impl ScriptRuntime for JsRuntime {
 
         let runtime_context = Rc::new(RefCell::new(JsRuntimeContext {
             context,
+            _inspector: inspector,
             input,
             output,
             process_func,
-            //inspector,
         }));
         self.isolate.set_slot(runtime_context);
 
@@ -96,9 +97,6 @@ impl ScriptRuntime for JsRuntime {
         let context = runtime_context.clone();
         let process_func = context.borrow_mut().process_func.clone();
         {
-            let mut client = InspectorClient::new();
-            let mut inspector = V8Inspector::create(&mut self.isolate, &mut client);
-
             let context = &mut *context.borrow_mut();
             let scope = &mut v8::HandleScope::with_context(&mut self.isolate, &context.context);
             if v8::Local::new(scope, &context.input).byte_length() != input.len() * size_of::<f32>()
@@ -116,8 +114,6 @@ impl ScriptRuntime for JsRuntime {
 
             let input_arr = v8::Local::new(scope, &context.input);
             let output_arr = v8::Local::new(scope, &context.output);
-            let context = v8::Local::new(scope, &context.context);
-            inspector.context_created(context, 1, StringView::empty(), StringView::empty());
 
             let backing_store = input_arr.get_backing_store();
             unsafe {
@@ -151,21 +147,47 @@ impl ScriptRuntime for JsRuntime {
     }
 }
 
-struct InspectorClient(V8InspectorClientBase);
+struct InspectorClient {
+    v8_inspector_client: v8::inspector::V8InspectorClientBase,
+    v8_inspector: Rc<RefCell<v8::UniquePtr<v8::inspector::V8Inspector>>>,
+}
 
 impl InspectorClient {
-    fn new() -> Self {
-        Self(V8InspectorClientBase::new::<Self>())
+    fn new(scope: &mut v8::HandleScope, context: v8::Local<v8::Context>) -> Rc<RefCell<Self>> {
+        let v8_inspector_client = v8::inspector::V8InspectorClientBase::new::<Self>();
+        let self__ = Rc::new(RefCell::new(Self {
+            v8_inspector_client,
+            v8_inspector: Default::default(),
+        }));
+        {
+            // MEMO: self__ が drop される前に client が無効な参照になると panic するので注意
+            let mut self_ = self__.borrow_mut();
+            let client = &mut *self_;
+            self_.v8_inspector = Rc::new(RefCell::new(
+                v8::inspector::V8Inspector::create(scope, client).into(),
+            ));
+            let context_name = v8::inspector::StringView::from(&b"main realm"[..]);
+            let aux_data = r#"{"isDefault": true}"#;
+            let aux_data_view = v8::inspector::StringView::from(aux_data.as_bytes());
+            self_
+                .v8_inspector
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .context_created(context, 1, context_name, aux_data_view);
+        }
+
+        self__
     }
 }
 
-impl V8InspectorClientImpl for InspectorClient {
-    fn base(&self) -> &V8InspectorClientBase {
-        &self.0
+impl v8::inspector::V8InspectorClientImpl for InspectorClient {
+    fn base(&self) -> &v8::inspector::V8InspectorClientBase {
+        &self.v8_inspector_client
     }
 
-    fn base_mut(&mut self) -> &mut V8InspectorClientBase {
-        &mut self.0
+    fn base_mut(&mut self) -> &mut v8::inspector::V8InspectorClientBase {
+        &mut self.v8_inspector_client
     }
 
     unsafe fn base_ptr(this: *const Self) -> *const v8::inspector::V8InspectorClientBase
@@ -173,18 +195,18 @@ impl V8InspectorClientImpl for InspectorClient {
         Self: Sized,
     {
         // SAFETY: this pointer is valid for the whole lifetime of inspector
-        unsafe { std::ptr::addr_of!((*this).0) }
+        unsafe { std::ptr::addr_of!((*this).v8_inspector_client) }
     }
 
     fn console_api_message(
         &mut self,
         _context_group_id: i32,
         _level: i32,
-        message: &StringView,
-        _url: &StringView,
+        message: &v8::inspector::StringView,
+        _url: &v8::inspector::StringView,
         _line_number: u32,
         _column_number: u32,
-        _stack_trace: &mut V8StackTrace,
+        _stack_trace: &mut v8::inspector::V8StackTrace,
     ) {
         // ログメッセージの出力
         println!("{}", message);
