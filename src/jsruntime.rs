@@ -15,20 +15,29 @@ pub trait ScriptRuntime {
     ) -> Result<(), Box<dyn error::Error>>;
 }
 
+pub struct JsRuntimeBuilder {
+    on_log_func: Option<fn(String)>,
+}
+
 pub struct JsRuntime {
     isolate: v8::OwnedIsolate,
+    on_log_func: Option<fn(String)>,
 }
 
 struct JsRuntimeContext {
     context: v8::Global<v8::Context>,
-    _inspector: Rc<RefCell<InspectorClient>>,
+    _inspector: Option<Rc<RefCell<InspectorClient>>>,
     input: v8::Global<v8::ArrayBuffer>,
     output: v8::Global<v8::ArrayBuffer>,
     process_func: v8::Global<v8::Function>,
 }
 
-impl JsRuntime {
-    pub fn new() -> JsRuntime {
+impl JsRuntimeBuilder {
+    pub fn new() -> Self {
+        JsRuntimeBuilder { on_log_func: None }
+    }
+
+    pub fn build(self) -> JsRuntime {
         static PUPPY_INIT: Once = Once::new();
         PUPPY_INIT.call_once(move || {
             let platform = v8::new_default_platform(0, false).make_shared();
@@ -36,7 +45,15 @@ impl JsRuntime {
             v8::V8::initialize();
         });
         let isolate = v8::Isolate::new(Default::default());
-        JsRuntime { isolate }
+        JsRuntime {
+            isolate,
+            on_log_func: self.on_log_func,
+        }
+    }
+
+    pub fn on_log(mut self, on_log_func: fn(String)) -> Self {
+        self.on_log_func = Some(on_log_func);
+        self
     }
 }
 
@@ -48,10 +65,13 @@ impl ScriptRuntime for JsRuntime {
             v8::Global::new(handle_scope, context)
         };
 
-        let inspector = {
+        let inspector = if let Some(on_log_func) = self.on_log_func {
             let scope = &mut v8::HandleScope::with_context(&mut self.isolate, &context);
             let context = v8::Local::new(scope, &context);
-            InspectorClient::new(scope, context)
+            let inspector = InspectorClient::new(scope, context, on_log_func);
+            Some(inspector)
+        } else {
+            None
         };
 
         let (input, output) = {
@@ -150,14 +170,20 @@ impl ScriptRuntime for JsRuntime {
 struct InspectorClient {
     v8_inspector_client: v8::inspector::V8InspectorClientBase,
     v8_inspector: Rc<RefCell<v8::UniquePtr<v8::inspector::V8Inspector>>>,
+    on_log_func: fn(String),
 }
 
 impl InspectorClient {
-    fn new(scope: &mut v8::HandleScope, context: v8::Local<v8::Context>) -> Rc<RefCell<Self>> {
+    fn new(
+        scope: &mut v8::HandleScope,
+        context: v8::Local<v8::Context>,
+        on_log_func: fn(String),
+    ) -> Rc<RefCell<Self>> {
         let v8_inspector_client = v8::inspector::V8InspectorClientBase::new::<Self>();
         let self__ = Rc::new(RefCell::new(Self {
             v8_inspector_client,
             v8_inspector: Default::default(),
+            on_log_func,
         }));
         {
             // MEMO: self__ が drop される前に client が無効な参照になると panic するので注意
@@ -209,7 +235,7 @@ impl v8::inspector::V8InspectorClientImpl for InspectorClient {
         _stack_trace: &mut v8::inspector::V8StackTrace,
     ) {
         // ログメッセージの出力
-        println!("{}", message);
+        (self.on_log_func)(message.to_string());
     }
 }
 
@@ -219,7 +245,7 @@ mod tests {
 
     #[test]
     fn compile() {
-        let mut runtime: Box<dyn ScriptRuntime> = Box::new(JsRuntime::new());
+        let mut runtime: Box<dyn ScriptRuntime> = Box::new(JsRuntimeBuilder::new().build());
         let result = runtime
             .compile("(input, output) => input.forEach((v, i) => { output[i] = v * 2.0; });");
         assert!(result.is_ok());
@@ -227,7 +253,7 @@ mod tests {
 
     #[test]
     fn process() {
-        let mut runtime: Box<dyn ScriptRuntime> = Box::new(JsRuntime::new());
+        let mut runtime: Box<dyn ScriptRuntime> = Box::new(JsRuntimeBuilder::new().build());
         let result = runtime
             .compile("(input, output) => input.forEach((v, i) => { output[i] = v * 2.0; });");
         assert!(result.is_ok());

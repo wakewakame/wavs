@@ -7,7 +7,13 @@ fn main() {
     let (input_tx, input_rx) = mpsc::channel::<Vec<f32>>();
     let (output_tx, output_rx) = mpsc::channel::<Vec<f32>>();
     let th = thread::spawn(move || {
-        let mut runtime: Box<dyn jsruntime::ScriptRuntime> = Box::new(jsruntime::JsRuntime::new());
+        let mut runtime: Box<dyn jsruntime::ScriptRuntime> = Box::new(
+            jsruntime::JsRuntimeBuilder::new()
+                .on_log(|log| {
+                    println!("{}", log);
+                })
+                .build(),
+        );
         _ = (&mut *runtime).compile(
             r#"
 			console.log("hello world");
