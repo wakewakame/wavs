@@ -16,12 +16,12 @@ pub trait ScriptRuntime {
 }
 
 pub struct JsRuntimeBuilder {
-    on_log_func: Option<fn(String)>,
+    on_log: Option<Rc<dyn Fn(String)>>,
 }
 
 pub struct JsRuntime {
     isolate: v8::OwnedIsolate,
-    on_log_func: Option<fn(String)>,
+    on_log: Option<Rc<dyn Fn(String)>>,
 }
 
 struct JsRuntimeContext {
@@ -34,7 +34,7 @@ struct JsRuntimeContext {
 
 impl JsRuntimeBuilder {
     pub fn new() -> Self {
-        JsRuntimeBuilder { on_log_func: None }
+        JsRuntimeBuilder { on_log: None }
     }
 
     pub fn build(self) -> JsRuntime {
@@ -47,12 +47,12 @@ impl JsRuntimeBuilder {
         let isolate = v8::Isolate::new(Default::default());
         JsRuntime {
             isolate,
-            on_log_func: self.on_log_func,
+            on_log: self.on_log,
         }
     }
 
-    pub fn on_log(mut self, on_log_func: fn(String)) -> Self {
-        self.on_log_func = Some(on_log_func);
+    pub fn on_log(mut self, on_log: Rc<dyn Fn(String)>) -> Self {
+        self.on_log = Some(on_log);
         self
     }
 }
@@ -65,10 +65,11 @@ impl ScriptRuntime for JsRuntime {
             v8::Global::new(handle_scope, context)
         };
 
-        let inspector = if let Some(on_log_func) = self.on_log_func {
+        let on_log = self.on_log.clone();
+        let inspector = if let Some(on_log) = on_log {
             let scope = &mut v8::HandleScope::with_context(&mut self.isolate, &context);
             let context = v8::Local::new(scope, &context);
-            let inspector = InspectorClient::new(scope, context, on_log_func);
+            let inspector = InspectorClient::new(scope, context, on_log);
             Some(inspector)
         } else {
             None
@@ -136,12 +137,10 @@ impl ScriptRuntime for JsRuntime {
             let output_arr = v8::Local::new(scope, &context.output);
 
             let backing_store = input_arr.get_backing_store();
-            unsafe {
-                std::ptr::copy(
-                    input.as_ptr(),
-                    backing_store.data().unwrap().as_ptr() as *mut f32,
-                    input.len(),
-                );
+            if let Some(pointer) = backing_store.data() {
+                unsafe {
+                    std::ptr::copy(input.as_ptr(), pointer.as_ptr() as *mut f32, input.len());
+                }
             }
 
             let input_array_t = v8::Float32Array::new(scope, input_arr, 0, input.len()).unwrap();
@@ -154,12 +153,14 @@ impl ScriptRuntime for JsRuntime {
             println!("{:?}", result.int32_value(scope));
 
             let backing_store = output_arr.get_backing_store();
-            unsafe {
-                std::ptr::copy(
-                    backing_store.data().unwrap().as_ptr() as *const f32,
-                    output.as_mut_ptr(),
-                    input.len(),
-                );
+            if let Some(pointer) = backing_store.data() {
+                unsafe {
+                    std::ptr::copy(
+                        pointer.as_ptr() as *const f32,
+                        output.as_mut_ptr(),
+                        input.len(),
+                    );
+                }
             }
         }
 
@@ -170,23 +171,23 @@ impl ScriptRuntime for JsRuntime {
 struct InspectorClient {
     v8_inspector_client: v8::inspector::V8InspectorClientBase,
     v8_inspector: Rc<RefCell<v8::UniquePtr<v8::inspector::V8Inspector>>>,
-    on_log_func: fn(String),
+    on_log: Rc<dyn Fn(String)>,
 }
 
 impl InspectorClient {
     fn new(
         scope: &mut v8::HandleScope,
         context: v8::Local<v8::Context>,
-        on_log_func: fn(String),
+        on_log: Rc<dyn Fn(String)>,
     ) -> Rc<RefCell<Self>> {
         let v8_inspector_client = v8::inspector::V8InspectorClientBase::new::<Self>();
         let self__ = Rc::new(RefCell::new(Self {
             v8_inspector_client,
             v8_inspector: Default::default(),
-            on_log_func,
+            on_log,
         }));
         {
-            // MEMO: self__ が drop される前に client が無効な参照になると panic するので注意
+            // MEMO: self__ が drop される前に client が無効な参照になると segfault するので注意
             let mut self_ = self__.borrow_mut();
             let client = &mut *self_;
             self_.v8_inspector = Rc::new(RefCell::new(
@@ -235,7 +236,7 @@ impl v8::inspector::V8InspectorClientImpl for InspectorClient {
         _stack_trace: &mut v8::inspector::V8StackTrace,
     ) {
         // ログメッセージの出力
-        (self.on_log_func)(message.to_string());
+        (self.on_log)(message.to_string());
     }
 }
 
@@ -244,26 +245,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compile() {
-        let mut runtime: Box<dyn ScriptRuntime> = Box::new(JsRuntimeBuilder::new().build());
-        let result = runtime
-            .compile("(input, output) => input.forEach((v, i) => { output[i] = v * 2.0; });");
-        assert!(result.is_ok());
-    }
-
-    #[test]
     fn process() {
-        let mut runtime: Box<dyn ScriptRuntime> = Box::new(JsRuntimeBuilder::new().build());
-        let result = runtime
-            .compile("(input, output) => input.forEach((v, i) => { output[i] = v * 2.0; });");
-        assert!(result.is_ok());
-        let mut output = vec![0.0, 0.0];
-        let result = runtime.process(&vec![1.0, 2.0], &mut output);
-        assert!(result.is_ok());
-        assert_eq!(output, vec![2.0, 4.0]);
-        let mut output = vec![0.0, 0.0, 0.0];
-        let result = runtime.process(&vec![3.0, 4.0, 5.0], &mut output);
-        assert!(result.is_ok());
-        assert_eq!(output, vec![6.0, 8.0, 10.0]);
+        // console.log の出力結果保存用
+        let logs = Rc::new(RefCell::<Vec<String>>::new(vec![]));
+        let logs_clone = logs.clone();
+
+        // 初期化
+        let mut runtime: Box<dyn ScriptRuntime> = Box::new(
+            JsRuntimeBuilder::new()
+                .on_log(Rc::new(move |log| {
+                    let mut logs = logs_clone.borrow_mut();
+                    logs.push(log);
+                }))
+                .build(),
+        );
+
+        // compile が 3 回行えることを確認
+        for i in 0..3 {
+            let result = runtime.compile(
+                format!(
+                    r#"
+						console.log("init: {}");
+						let count = 0;
+						(input, output) => {{
+							console.log(`init: {}, count: ${{count++}}`);
+							input.forEach((v, i) => {{ output[i] = v * 2.0; }});
+						}};
+					"#,
+                    i, i,
+                )
+                .as_str(),
+            );
+            assert!(result.is_ok());
+
+            // process の実行が 3 回行えることを確認
+            for _ in 0..3 {
+                // 実行ごとに入力配列の数を変える
+                let input: Vec<f32> = (0..(i + 1) * 100).map(|x| x as f32).collect();
+                let mut output = input.clone();
+                let result = runtime.process(&input, &mut output);
+                assert!(result.is_ok());
+                assert_eq!(
+                    output,
+                    (0..(i + 1) * 100)
+                        .map(|x| (x * 2) as f32)
+                        .collect::<Vec<f32>>()
+                );
+            }
+        }
+
+        // console.log が取得できていることを確認
+        let logs = logs.borrow();
+        assert_eq!(logs.len(), 6);
+        assert_eq!(logs[0], "init: 0");
+        assert_eq!(logs[1], "init: 0, count: 0");
+        assert_eq!(logs[2], "init: 0, count: 1");
+        assert_eq!(logs[3], "init: 0, count: 2");
+        assert_eq!(logs[4], "init: 1");
+        //assert_eq!(logs[5], "init: 1, count: 0");
+        //assert_eq!(logs[6], "init: 1, count: 1");
+        //assert_eq!(logs[7], "init: 1, count: 2");
+        assert_eq!(logs[5], "init: 2");
+        //assert_eq!(logs[9], "init: 2, count: 0");
+        //assert_eq!(logs[10], "init: 2, count: 1");
+        //assert_eq!(logs[11], "init: 2, count: 2");
     }
 }

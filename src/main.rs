@@ -1,5 +1,6 @@
 mod jsruntime;
 
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 
@@ -9,9 +10,9 @@ fn main() {
     let th = thread::spawn(move || {
         let mut runtime: Box<dyn jsruntime::ScriptRuntime> = Box::new(
             jsruntime::JsRuntimeBuilder::new()
-                .on_log(|log| {
+                .on_log(Rc::new(|log| {
                     println!("{}", log);
-                })
+                }))
                 .build(),
         );
         _ = (&mut *runtime).compile(
