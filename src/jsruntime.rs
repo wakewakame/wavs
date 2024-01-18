@@ -59,6 +59,12 @@ impl JsRuntimeBuilder {
 
 impl ScriptRuntime for JsRuntime {
     fn compile(&mut self, code: &str) -> Result<(), Box<dyn error::Error>> {
+        // MEMO:
+        //   新しい inspector を作った後に set_slot で古い inspector を drop すると
+        //   古い inspector のデストラクタが新しい inspector に影響して console.log
+        //   の出力を得られなくなってしまうため、先にここで古いインスタンスを drop しておく。
+        self.isolate.remove_slot::<Rc<RefCell<JsRuntimeContext>>>();
+
         let context = {
             let handle_scope = &mut v8::HandleScope::new(&mut self.isolate);
             let context = v8::Context::new(handle_scope);
@@ -296,18 +302,18 @@ mod tests {
 
         // console.log が取得できていることを確認
         let logs = logs.borrow();
-        assert_eq!(logs.len(), 6);
+        assert_eq!(logs.len(), 12);
         assert_eq!(logs[0], "init: 0");
         assert_eq!(logs[1], "init: 0, count: 0");
         assert_eq!(logs[2], "init: 0, count: 1");
         assert_eq!(logs[3], "init: 0, count: 2");
         assert_eq!(logs[4], "init: 1");
-        //assert_eq!(logs[5], "init: 1, count: 0");
-        //assert_eq!(logs[6], "init: 1, count: 1");
-        //assert_eq!(logs[7], "init: 1, count: 2");
-        assert_eq!(logs[5], "init: 2");
-        //assert_eq!(logs[9], "init: 2, count: 0");
-        //assert_eq!(logs[10], "init: 2, count: 1");
-        //assert_eq!(logs[11], "init: 2, count: 2");
+        assert_eq!(logs[5], "init: 1, count: 0");
+        assert_eq!(logs[6], "init: 1, count: 1");
+        assert_eq!(logs[7], "init: 1, count: 2");
+        assert_eq!(logs[8], "init: 2");
+        assert_eq!(logs[9], "init: 2, count: 0");
+        assert_eq!(logs[10], "init: 2, count: 1");
+        assert_eq!(logs[11], "init: 2, count: 2");
     }
 }
