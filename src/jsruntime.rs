@@ -406,17 +406,15 @@ mod tests {
         // compile が 3 回行えることを確認
         for i in 0..3 {
             let result = runtime.compile(
-                format!(
-                    r#"
-						console.log("init: {}");
-						let count = 0;
-						(input, output) => {{
-							console.log(`init: {}, count: ${{count++}}`);
-							input.forEach((v, i) => {{ output[i] = v * 2.0; }});
-						}};
-					"#,
-                    i, i,
-                )
+                r#"
+                    console.log("init: ${i}");
+                    let count = 0;
+                    (input, output) => {
+                        console.log(`init: ${i}, count: ${count++}`);
+                        input.forEach((v, i) => {{ output[i] = v * 2.0; }});
+                    };
+                "#
+                .replace("${i}", &i.to_string())
                 .as_str(),
             );
             assert!(result.is_ok());
@@ -452,5 +450,41 @@ mod tests {
         assert_eq!(logs[9], "init: 2, count: 0");
         assert_eq!(logs[10], "init: 2, count: 1");
         assert_eq!(logs[11], "init: 2, count: 2");
+    }
+
+    #[test]
+    fn compile_error() {
+        let mut runtime: Box<dyn ScriptRuntime> = Box::new(JsRuntimeBuilder::new().build());
+
+        // 不正な構文
+        let result = runtime.compile("let a == 1;");
+        assert!(result.is_err());
+
+        // 関数を返す前に例外
+        let result = runtime.compile("new Error('aaa');");
+        assert!(result.is_err());
+
+        // 返される値が関数でない
+        let result = runtime.compile("undefined;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn process_error() {
+        let mut runtime: Box<dyn ScriptRuntime> = Box::new(JsRuntimeBuilder::new().build());
+
+        // 処理中に例外
+        let result = runtime.compile(
+            r#"
+                (input, output) => {
+                    throw new Error('aaa');
+                };
+            "#,
+        );
+        assert!(result.is_ok());
+        let input: Vec<f32> = (0..100).map(|x| x as f32).collect();
+        let mut output = input.clone();
+        let result = runtime.process(&input, &mut output);
+        assert!(result.is_err());
     }
 }
