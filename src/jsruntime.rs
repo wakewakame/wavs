@@ -1,18 +1,16 @@
 use std::cell::RefCell;
-use std::error;
 use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Once;
+use thiserror::Error;
 use v8;
+
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub trait ScriptRuntime {
     //fn init(&mut self, param: ());
-    fn compile(&mut self, code: &str) -> Result<(), Box<dyn error::Error>>;
-    fn process(
-        &mut self,
-        input: &Vec<f32>,
-        output: &mut Vec<f32>,
-    ) -> Result<(), Box<dyn error::Error>>;
+    fn compile(&mut self, code: &str) -> Result<()>;
+    fn process(&mut self, input: &Vec<f32>, output: &mut Vec<f32>) -> Result<()>;
 }
 
 pub struct JsRuntimeBuilder {
@@ -30,6 +28,18 @@ struct JsRuntimeContext {
     input: v8::Global<v8::ArrayBuffer>,
     output: v8::Global<v8::ArrayBuffer>,
     process_func: v8::Global<v8::Function>,
+}
+
+#[derive(Debug, Error)]
+enum JsRuntimeError {
+    #[error("failed to compile: `{0}`")]
+    CompileError(String),
+    #[error("failed to process: `{0}`")]
+    ProcessError(String),
+    #[error("process function is not compiled")]
+    NoProcessFunction,
+    #[error("unexpected error: {0}")]
+    UnexpectedError(String),
 }
 
 impl JsRuntimeBuilder {
@@ -58,7 +68,7 @@ impl JsRuntimeBuilder {
 }
 
 impl ScriptRuntime for JsRuntime {
-    fn compile(&mut self, code: &str) -> Result<(), Box<dyn error::Error>> {
+    fn compile(&mut self, code: &str) -> Result<()> {
         // MEMO:
         //   新しい inspector を作った後に set_slot で古い inspector を drop すると
         //   古い inspector のデストラクタが新しい inspector に影響して console.log
@@ -75,7 +85,7 @@ impl ScriptRuntime for JsRuntime {
         let inspector = if let Some(on_log) = on_log {
             let scope = &mut v8::HandleScope::with_context(&mut self.isolate, &context);
             let context = v8::Local::new(scope, &context);
-            let inspector = InspectorClient::new(scope, context, on_log);
+            let inspector = InspectorClient::new(scope, context, on_log)?;
             Some(inspector)
         } else {
             None
@@ -92,10 +102,43 @@ impl ScriptRuntime for JsRuntime {
 
         let process_func = {
             let scope = &mut v8::HandleScope::with_context(&mut self.isolate, &context);
-            let code = v8::String::new(scope, code).unwrap();
-            let script = v8::Script::compile(scope, code, None).unwrap();
-            let process_func = script.run(scope).unwrap();
-            let process_func = v8::Local::<v8::Function>::try_from(process_func).unwrap();
+            let code = match v8::String::new(scope, code) {
+                Some(code) => code,
+                None => {
+                    return Err(
+                        JsRuntimeError::UnexpectedError("failed to allocate string".into()).into(),
+                    )
+                }
+            };
+            let process_func = {
+                let mut try_catch = v8::TryCatch::new(scope);
+                let script = match v8::Script::compile(&mut try_catch, code, None) {
+                    Some(script) => script,
+                    None => {
+                        return Err(
+                            JsRuntimeError::CompileError(report_exceptions(try_catch)).into()
+                        );
+                    }
+                };
+                let process_func = match script.run(&mut try_catch) {
+                    Some(process_func) => process_func,
+                    None => {
+                        return Err(
+                            JsRuntimeError::CompileError(report_exceptions(try_catch)).into()
+                        );
+                    }
+                };
+                let process_func = match v8::Local::<v8::Function>::try_from(process_func) {
+                    Ok(process_func) => process_func,
+                    Err(_e) => {
+                        return Err(JsRuntimeError::CompileError(
+                            "returned value may not be a function".to_string(),
+                        )
+                        .into())
+                    }
+                };
+                process_func
+            };
             let process_func = v8::Global::new(scope, process_func);
             process_func
         };
@@ -112,15 +155,11 @@ impl ScriptRuntime for JsRuntime {
         Ok(())
     }
 
-    fn process(
-        &mut self,
-        input: &Vec<f32>,
-        output: &mut Vec<f32>,
-    ) -> Result<(), Box<dyn error::Error>> {
-        let runtime_context = self
-            .isolate
-            .get_slot::<Rc<RefCell<JsRuntimeContext>>>()
-            .unwrap();
+    fn process(&mut self, input: &Vec<f32>, output: &mut Vec<f32>) -> Result<()> {
+        let runtime_context = match self.isolate.get_slot::<Rc<RefCell<JsRuntimeContext>>>() {
+            Some(runtime_context) => runtime_context,
+            None => return Err(JsRuntimeError::NoProcessFunction.into()),
+        };
         let context = runtime_context.clone();
         let process_func = context.borrow_mut().process_func.clone();
         {
@@ -149,14 +188,41 @@ impl ScriptRuntime for JsRuntime {
                 }
             }
 
-            let input_array_t = v8::Float32Array::new(scope, input_arr, 0, input.len()).unwrap();
-            let output_array_t = v8::Float32Array::new(scope, output_arr, 0, output.len()).unwrap();
+            let input_array_t = match v8::Float32Array::new(scope, input_arr, 0, input.len()) {
+                Some(input_array_t) => input_array_t,
+                None => {
+                    return Err(JsRuntimeError::UnexpectedError(
+                        "failed to create input array".into(),
+                    )
+                    .into())
+                }
+            };
+            let output_array_t = match v8::Float32Array::new(scope, output_arr, 0, output.len()) {
+                Some(output_array_t) => output_array_t,
+                None => {
+                    return Err(JsRuntimeError::UnexpectedError(
+                        "failed to create output array".into(),
+                    )
+                    .into())
+                }
+            };
 
             let this = v8::undefined(scope).into();
-            let result = process_func
-                .call(scope, this, &[input_array_t.into(), output_array_t.into()])
-                .unwrap();
-            println!("{:?}", result.int32_value(scope));
+            let _result = {
+                let mut try_catch = v8::TryCatch::new(scope);
+                match process_func.call(
+                    &mut try_catch,
+                    this,
+                    &[input_array_t.into(), output_array_t.into()],
+                ) {
+                    Some(result) => result,
+                    None => {
+                        return Err(
+                            JsRuntimeError::ProcessError(report_exceptions(try_catch)).into()
+                        );
+                    }
+                }
+            };
 
             let backing_store = output_arr.get_backing_store();
             if let Some(pointer) = backing_store.data() {
@@ -185,7 +251,7 @@ impl InspectorClient {
         scope: &mut v8::HandleScope,
         context: v8::Local<v8::Context>,
         on_log: Rc<dyn Fn(String)>,
-    ) -> Rc<RefCell<Self>> {
+    ) -> Result<Rc<RefCell<Self>>> {
         let v8_inspector_client = v8::inspector::V8InspectorClientBase::new::<Self>();
         let self__ = Rc::new(RefCell::new(Self {
             v8_inspector_client,
@@ -202,15 +268,20 @@ impl InspectorClient {
             let context_name = v8::inspector::StringView::from(&b"main realm"[..]);
             let aux_data = r#"{"isDefault": true}"#;
             let aux_data_view = v8::inspector::StringView::from(aux_data.as_bytes());
-            self_
-                .v8_inspector
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
-                .context_created(context, 1, context_name, aux_data_view);
+            match self_.v8_inspector.borrow_mut().as_mut() {
+                Some(v8_inspector) => {
+                    v8_inspector.context_created(context, 1, context_name, aux_data_view)
+                }
+                None => {
+                    return Err(JsRuntimeError::UnexpectedError(
+                        "failed to create inspector".into(),
+                    )
+                    .into())
+                }
+            };
         }
 
-        self__
+        Ok(self__)
     }
 }
 
@@ -244,6 +315,72 @@ impl v8::inspector::V8InspectorClientImpl for InspectorClient {
         // ログメッセージの出力
         (self.on_log)(message.to_string());
     }
+}
+
+// TryCatch からエラー情報を文字列に変換する
+fn report_exceptions(mut try_catch: v8::TryCatch<v8::HandleScope>) -> String {
+    let mut description = Vec::<String>::new();
+    let Some(exception) = try_catch.exception() else {
+        return "no error".into();
+    };
+    let Some(exception_string) = exception.to_string(&mut try_catch) else {
+        return "unexpected error".into();
+    };
+    let exception_string = exception_string.to_rust_string_lossy(&mut try_catch);
+    let Some(message) = try_catch.message() else {
+        return exception_string;
+    };
+
+    // 該当箇所の出力
+    // e.g.
+    //   main.js:5: SyntaxError: Unexpected token '=='
+    let filename = message
+        .get_script_resource_name(&mut try_catch)
+        .and_then(|s| s.to_string(&mut try_catch))
+        .map(|s| s.to_rust_string_lossy(&mut try_catch))
+        .unwrap_or("(unknown)".into());
+    let line_number = message
+        .get_line_number(&mut try_catch)
+        .map(|n| n.to_string())
+        .unwrap_or("(unknown)".into());
+    description.push(format!(
+        "{}:{}: {}",
+        filename, line_number, exception_string
+    ));
+
+    // 該当箇所のコードを出力
+    // e.g.
+    //   let a == 1;
+    //         ^^
+    if let Some(source_line) = message.get_source_line(&mut try_catch) {
+        let source_line = source_line.to_rust_string_lossy(&mut try_catch);
+        let start_column = message.get_start_column();
+        let end_column = message.get_end_column();
+        description.push(format!(
+            "\n{}\n{}{}\n",
+            source_line,
+            " ".repeat(start_column),
+            "^".repeat(end_column - start_column)
+        ));
+    }
+
+    // スタックトレースを出力
+    // e.g.
+    //   Error: aaa
+    //       at f3 (<anonymous>:4:26)
+    //       at f2 (<anonymous>:3:20)
+    //       at f1 (<anonymous>:2:20)
+    //       at main (<anonymous>:1:22)
+    //       at <anonymous>:5:1
+    if let Some(stack_trace) = try_catch
+        .stack_trace()
+        .and_then(|s| s.to_string(&mut try_catch))
+        .map(|s| s.to_rust_string_lossy(&mut try_catch))
+    {
+        description.push(format!("{}", stack_trace));
+    }
+
+    return description.join("\n");
 }
 
 #[cfg(test)]
